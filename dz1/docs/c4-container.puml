@@ -1,0 +1,78 @@
+@startuml c4-container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title C4 — Marketplace — Container diagram
+
+Person(buyer, "Покупатель", "Просматривает товары и оформляет заказы")
+Person(seller, "Продавец", "Управляет товарами и отслеживает продажи")
+
+System_Ext(payment_provider, "Платёжный провайдер", "Проводит оплаты, возвраты и выплаты продавцам")
+System_Ext(notification_provider, "Провайдер сообщений", "Отправляет email, SMS и push")
+System_Ext(delivery_provider, "Служба доставки", "Принимает отправление и сообщает статусы доставки")
+
+System_Boundary(marketplace, "Marketplace") {
+  Container(web_app, "Web App", "React", "Веб-интерфейс покупателей и продавцов")
+  Container(mobile_app, "Mobile App", "Flutter", "Мобильный интерфейс покупателей")
+  Container(api_gateway, "API Gateway / BFF", "Python / FastAPI", "Единая точка входа, маршрутизация и проверка токена")
+
+  Container(user_service, "User Service", "Python / FastAPI", "Аккаунты, роли, профили и адреса")
+  ContainerDb(user_db, "User DB", "PostgreSQL", "Пользователи, роли, профили, адреса")
+
+  Container(catalog_service, "Catalog Service", "Python / FastAPI", "Карточки товаров, категории, цены и остатки")
+  ContainerDb(catalog_db, "Catalog DB", "PostgreSQL", "Товары, категории, предложения продавцов и остатки")
+
+  Container(feed_service, "Feed Service", "Python / FastAPI", "Формирует персональную ленту и ранжирует товары")
+  ContainerDb(feed_db, "Feed DB", "Redis", "Профили интересов, признаки, популярность и кэш ленты")
+
+  Container(order_service, "Order Service", "Python / FastAPI", "Корзина и жизненный цикл заказа")
+  ContainerDb(order_db, "Order DB", "PostgreSQL", "Корзины, заказы, позиции и история статусов")
+
+  Container(payment_service, "Payment Service", "Python / FastAPI", "Оплаты, комиссии, расчёты и выплаты продавцам")
+  ContainerDb(payment_db, "Payment DB", "PostgreSQL", "Платежи, возвраты, комиссии, балансы и выплаты")
+
+  Container(notification_service, "Notification Service", "Python / FastAPI", "Шаблоны и доставка уведомлений")
+  ContainerDb(notification_db, "Notification DB", "PostgreSQL", "Шаблоны, проекция контактов и попытки доставки")
+
+  ContainerQueue(event_bus, "Event Bus", "Kafka", "Асинхронные доменные и поведенческие события")
+}
+
+Rel(buyer, web_app, "Использует", "HTTPS")
+Rel(buyer, mobile_app, "Использует", "HTTPS")
+Rel(seller, web_app, "Использует", "HTTPS")
+Rel(web_app, api_gateway, "Вызывает", "HTTPS/JSON")
+Rel(mobile_app, api_gateway, "Вызывает", "HTTPS/JSON")
+
+Rel(api_gateway, user_service, "Управляет пользователями", "Синхронно, HTTP/JSON")
+Rel(api_gateway, catalog_service, "Управляет/читает каталог", "Синхронно, HTTP/JSON")
+Rel(api_gateway, feed_service, "Запрашивает ленту", "Синхронно, HTTP/JSON")
+Rel(api_gateway, order_service, "Управляет корзиной и заказами", "Синхронно, HTTP/JSON")
+Rel(api_gateway, payment_service, "Маршрутизирует платёжный webhook", "Синхронно, HTTP/JSON")
+Rel(api_gateway, order_service, "Маршрутизирует webhook доставки", "Синхронно, HTTP/JSON")
+Rel(api_gateway, event_bus, "Публикует просмотры и клики", "Асинхронно, Kafka")
+
+Rel(user_service, user_db, "Читает и пишет", "SQL")
+Rel(catalog_service, catalog_db, "Читает и пишет", "SQL")
+Rel(feed_service, feed_db, "Читает и пишет", "Redis protocol")
+Rel(order_service, order_db, "Читает и пишет", "SQL")
+Rel(payment_service, payment_db, "Читает и пишет", "SQL")
+Rel(notification_service, notification_db, "Читает и пишет", "SQL")
+
+Rel(order_service, catalog_service, "Резервирует, списывает и освобождает товары", "Синхронно, HTTP/JSON")
+Rel(order_service, payment_service, "Инициирует оплату", "Синхронно, HTTP/JSON")
+Rel(order_service, delivery_provider, "Создаёт доставку", "HTTPS API")
+Rel(payment_service, payment_provider, "Создаёт оплату, возврат или выплату", "HTTPS API")
+Rel(payment_provider, api_gateway, "Передаёт webhook о статусе", "HTTPS")
+Rel(delivery_provider, api_gateway, "Передаёт webhook статуса доставки", "HTTPS")
+Rel(notification_service, notification_provider, "Отправляет сообщение", "HTTPS API")
+
+Rel(user_service, event_bus, "Публикует события профиля", "Асинхронно, Kafka")
+Rel(catalog_service, event_bus, "Публикует события каталога и резервов", "Асинхронно, Kafka")
+Rel(order_service, event_bus, "Публикует события корзины и заказа", "Асинхронно, Kafka")
+Rel(payment_service, event_bus, "Публикует события платежа", "Асинхронно, Kafka")
+Rel(event_bus, order_service, "Передаёт результаты платежа и истечение резерва", "Асинхронно, Kafka")
+Rel(event_bus, payment_service, "Передаёт статусы доставки и отмены заказа", "Асинхронно, Kafka")
+Rel(event_bus, feed_service, "Передаёт события поведения и каталога", "Асинхронно, Kafka")
+Rel(event_bus, notification_service, "Передаёт события профиля, заказа и платежа", "Асинхронно, Kafka")
+
+SHOW_LEGEND()
+@enduml
