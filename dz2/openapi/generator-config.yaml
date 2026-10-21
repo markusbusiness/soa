@@ -1,0 +1,15 @@
+generatorName: python-fastapi
+inputSpec: openapi/marketplace.yaml
+outputDir: generated
+templateDir: openapi/templates
+additionalProperties:
+  packageName: marketplace_api
+  sourceFolder: src
+globalProperties:
+  apis: ""
+  models: ""
+  supportingFiles: "security_api.py,extra_models.py,__init__.py"
+  apiTests: "false"
+  modelTests: "false"
+  apiDocs: "false"
+  modelDocs: "false"
