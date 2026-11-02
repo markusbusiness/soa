@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package flight.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Every call must carry the "x-api-key" metadata entry.
+//
+// Business errors are returned as standard gRPC status codes:
+//   INVALID_ARGUMENT     malformed request: bad UUID or IATA code, seat_count <= 0, arrival before departure
+//   NOT_FOUND            flight or reservation does not exist
+//   RESOURCE_EXHAUSTED   not enough available seats on the flight
+//   FAILED_PRECONDITION  flight is not SCHEDULED, forbidden status transition,
+//                        booking_id already used for a different flight or seat_count
+//   ALREADY_EXISTS       flight with this number already departs on that date
+//   UNAUTHENTICATED      x-api-key is missing or invalid
+service FlightService {
+  // Scheduled flights on a route, optionally on one departure date (UTC), ordered by departure time.
+  rpc SearchFlights(SearchFlightsRequest) returns (SearchFlightsResponse);
+
+  rpc GetFlight(GetFlightRequest) returns (Flight);
+
+  // Atomically checks availability, takes seat_count seats and creates the reservation.
+  // Idempotent by booking_id: a repeated call returns the existing reservation and takes no more seats.
+  rpc ReserveSeats(ReserveSeatsRequest) returns (SeatReservation);
+
+  // Returns the seats of the booking's reservation and marks it RELEASED.
+  // Idempotent: releasing an already released reservation returns it unchanged.
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (SeatReservation);
+
+  rpc CreateFlight(CreateFlightRequest) returns (Flight);
+
+  // Changes status, price or schedule. Allowed status transitions:
+  // SCHEDULED -> DEPARTED -> COMPLETED, SCHEDULED -> CANCELLED.
+  rpc UpdateFlight(UpdateFlightRequest) returns (Flight);
+}
+
+enum FlightStatus {
+  FLIGHT_STATUS_UNSPECIFIED = 0;
+  FLIGHT_STATUS_SCHEDULED = 1;
+  FLIGHT_STATUS_DEPARTED = 2;
+  FLIGHT_STATUS_CANCELLED = 3;
+  FLIGHT_STATUS_COMPLETED = 4;
+}
+
+enum ReservationStatus {
+  RESERVATION_STATUS_UNSPECIFIED = 0;
+  RESERVATION_STATUS_ACTIVE = 1;
+  RESERVATION_STATUS_RELEASED = 2;
+  RESERVATION_STATUS_EXPIRED = 3;
+}
+
+message Money {
+  // ISO 4217, e.g. "RUB".
+  string currency_code = 1;
+  // Amount in minor units (kopecks for RUB).
+  int64 amount_minor = 2;
+}
+
+message Airline {
+  // IATA airline designator, e.g. "SU".
+  string iata_code = 1;
+  string name = 2;
+}
+
+message Airport {
+  // IATA airport code, e.g. "SVO".
+  string iata_code = 1;
+  string name = 2;
+  string city = 3;
+}
+
+message Flight {
+  string id = 1;
+  // Airline designator followed by the number, e.g. "SU1234".
+  string flight_number = 2;
+  Airline airline = 3;
+  Airport origin = 4;
+  Airport destination = 5;
+  google.protobuf.Timestamp departure_time = 6;
+  google.protobuf.Timestamp arrival_time = 7;
+  int32 total_seats = 8;
+  int32 available_seats = 9;
+  // Price of one seat.
+  Money price = 10;
+  FlightStatus status = 11;
+}
+
+message SeatReservation {
+  string id = 1;
+  string flight_id = 2;
+  string booking_id = 3;
+  int32 seat_count = 4;
+  ReservationStatus status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message SearchFlightsRequest {
+  string origin = 1;
+  string destination = 2;
+  // Any instant of the departure day; the day is taken in UTC. All dates when not set.
+  google.protobuf.Timestamp departure_date = 3;
+}
+
+message SearchFlightsResponse {
+  repeated Flight flights = 1;
+}
+
+message GetFlightRequest {
+  string flight_id = 1;
+}
+
+message ReserveSeatsRequest {
+  string flight_id = 1;
+  int32 seat_count = 2;
+  // Booking Service identifier, the idempotency key of the reservation.
+  string booking_id = 3;
+}
+
+message ReleaseReservationRequest {
+  string booking_id = 1;
+}
+
+message CreateFlightRequest {
+  string flight_number = 1;
+  string origin = 2;
+  string destination = 3;
+  google.protobuf.Timestamp departure_time = 4;
+  google.protobuf.Timestamp arrival_time = 5;
+  int32 total_seats = 6;
+  Money price = 7;
+}
+
+// Fields that are not set stay unchanged.
+message UpdateFlightRequest {
+  string flight_id = 1;
+  optional FlightStatus status = 2;
+  Money price = 3;
+  google.protobuf.Timestamp departure_time = 4;
+  google.protobuf.Timestamp arrival_time = 5;
+}

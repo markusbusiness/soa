@@ -1,0 +1,8 @@
+generated
+__pycache__
+*.py[cod]
+.pytest_cache
+.venv
+.git
+.gitignore
+README.md
