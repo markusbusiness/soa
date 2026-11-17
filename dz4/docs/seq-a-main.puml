@@ -1,0 +1,41 @@
+@startuml seq-a-main
+title Вариант 1: основной сценарий (push подтверждён)
+autonumber
+participant "Продуктовый\nсервис" as P
+participant "Notification\nAPI" as API
+queue "Kafka" as K
+participant "Tx Router" as R
+participant "Preference\nService" as PS
+participant "Inbox\nService" as IN
+database "Delivery\nState DB" as DB
+participant "Outbox\nRelay" as OR
+participant "Push\nSender" as PSND
+participant "FCM / APNs" as FCM
+participant "Мобильное\nприложение" as APP
+participant "Receipt API" as RA
+participant "Receipt\nHandler" as RH
+
+P -> API: SendNotification(idempotency_key, user_id, type=TX, template, data)
+API -> K: produce tx.requested (key=notification_id, acks=all)
+API --> P: 202 Accepted(notification_id)
+K -> R: tx.requested
+R -> PS: GetDeliveryPlan(user_id, TX)
+PS --> R: [push 10s, sms 120s, email], контакты, токены
+R -> IN: WriteInbox(notification)
+R -> DB: BEGIN; INSERT delivery(state='PUSH_PENDING',\nnext_action_at=now()+30s) ON CONFLICT DO NOTHING;\nINSERT outbox(tx.send.push); COMMIT
+R -> K: commit offset
+OR -> DB: читает outbox из WAL
+OR -> K: tx.send.push
+K -> PSND: tx.send.push
+PSND -> DB: UPDATE SET state='PUSH_SENDING'\nWHERE id=? AND state='PUSH_PENDING' (1 строка)
+PSND -> FCM: send(token, apns-collapse-id / tag = notification_id, ttl=10s)
+FCM --> PSND: message_id
+PSND -> DB: UPDATE SET state='PUSH_SENT', next_action_at=now()+10s\nWHERE id=? AND state='PUSH_SENDING'
+FCM -> APP: push
+APP -> RA: POST /receipts {notification_id, channel=push}
+RA -> K: receipts
+RA --> APP: 204
+K -> RH: receipts
+RH -> DB: BEGIN; UPDATE SET state='DELIVERED', next_action_at=NULL\nWHERE id=? AND state NOT IN ('DELIVERED','UNCONFIRMED','FAILED');\nINSERT outbox(delivery-events); COMMIT
+note over DB: Escalation Scheduler больше не увидит запись:\nnext_action_at = NULL
+@enduml

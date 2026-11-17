@@ -1,0 +1,53 @@
+@startuml c4-variant-a
+!include <C4/C4_Container>
+
+title Вариант 1: хореография на Kafka + машина состояний в PostgreSQL (Container)
+
+System_Ext(producers, "Продуктовые сервисы банка", "Процессинг карт, переводы, кредиты")
+System_Ext(app, "Мобильное приложение", "Показывает push и in-app ленту, отправляет квитанцию о получении push")
+System_Ext(push_prov, "FCM / APNs / RuStore Push", "Доставка push на устройство")
+System_Ext(sms_prov, "SMS-агрегаторы A и B", "Отправка SMS, DLR-вебхуки")
+System_Ext(email_prov, "Email-провайдеры A и B", "Отправка email, вебхуки статусов")
+
+System_Boundary(np, "Notification Platform: подсистема гарантированной доставки") {
+  Container(api, "Notification API", "Go, gRPC", "Валидация, ключ идемпотентности, запись в Kafka")
+  ContainerQueue(kafka, "Kafka", "Apache Kafka 3.x, RF=3, acks=all", "tx.requested, tx.send.push/sms/email, receipts, delivery-events")
+  Container(router, "Tx Router", "Go", "Строит план каналов, создаёт запись доставки, ставит первый шаг")
+  Container(senders, "Channel Senders", "Go: push / sms / email", "Отправка в провайдера, переключение провайдера внутри канала")
+  Container(scheduler, "Escalation Scheduler", "Go", "Опрашивает просроченные шаги и эскалирует на следующий канал")
+  Container(receipt_api, "Receipt API", "Go, HTTPS", "Квитанции приложения и вебхуки провайдеров")
+  Container(receipt_handler, "Receipt Handler", "Go", "Переводит доставку в DELIVERED условным UPDATE")
+  ContainerDb(state_db, "Delivery State DB", "PostgreSQL 16, 4 шарда × 3 узла по hash(notification_id), Patroni", "Состояние доставки, next_action_at, outbox")
+  Container(relay, "Outbox Relay", "Debezium", "Публикует outbox-записи в Kafka")
+  Container(pref, "Preference Service", "Go + PostgreSQL + Redis", "Настройки, согласия, контакты, push-токены")
+  Container(inbox, "Inbox Service", "Go + Cassandra", "In-app лента уведомлений")
+  ContainerDb(ch, "Delivery Analytics", "ClickHouse", "События доставки, отчёты, хранение 3 года")
+  Container(obs, "Observability", "Prometheus, Grafana, OpenTelemetry, Alertmanager", "Метрики, трейсы, алерты")
+}
+
+Rel(producers, api, "SendNotification", "gRPC")
+Rel(api, kafka, "tx.requested", "Kafka")
+Rel(kafka, router, "tx.requested", "Kafka")
+Rel(router, pref, "План каналов и контакты", "gRPC")
+Rel(router, inbox, "Запись в ленту", "gRPC")
+Rel(router, state_db, "INSERT ... ON CONFLICT DO NOTHING + outbox", "SQL")
+Rel(relay, state_db, "Читает WAL outbox", "logical replication")
+Rel(relay, kafka, "tx.send.*", "Kafka")
+Rel(kafka, senders, "tx.send.*", "Kafka")
+Rel(senders, state_db, "Условный UPDATE шага + next_action_at", "SQL")
+Rel(scheduler, state_db, "SELECT ... FOR UPDATE SKIP LOCKED, эскалация + outbox", "SQL")
+Rel(senders, push_prov, "Push, ttl = таймаут шага", "HTTPS")
+Rel(senders, sms_prov, "SMS, client_msg_id", "HTTPS")
+Rel(senders, email_prov, "Email", "HTTPS")
+Rel(push_prov, app, "Push")
+Rel(app, receipt_api, "Квитанция о получении", "HTTPS")
+Rel(sms_prov, receipt_api, "DLR", "HTTPS webhook")
+Rel(email_prov, receipt_api, "Статус", "HTTPS webhook")
+Rel(receipt_api, kafka, "receipts", "Kafka")
+Rel(kafka, receipt_handler, "receipts", "Kafka")
+Rel(receipt_handler, state_db, "UPDATE ... SET state='DELIVERED' из любого нетерминального", "SQL")
+Rel(kafka, ch, "delivery-events", "Kafka engine")
+Rel(obs, senders, "Метрики и трейсы", "OTLP / Prometheus")
+
+SHOW_LEGEND()
+@enduml

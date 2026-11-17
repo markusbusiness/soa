@@ -1,0 +1,58 @@
+@startuml c4-variant-b
+!include <C4/C4_Container>
+
+title Вариант 2: durable-оркестрация доставки на Temporal (Container)
+
+System_Ext(producers, "Продуктовые сервисы банка", "Процессинг карт, переводы, кредиты")
+System_Ext(app, "Мобильное приложение", "Показывает push и in-app ленту, отправляет квитанцию о получении push")
+System_Ext(push_prov, "FCM / APNs / RuStore Push", "Доставка push на устройство")
+System_Ext(sms_prov, "SMS-агрегаторы A и B", "Отправка SMS, DLR-вебхуки")
+System_Ext(email_prov, "Email-провайдеры A и B", "Отправка email, вебхуки статусов")
+
+System_Boundary(np, "Notification Platform: подсистема гарантированной доставки") {
+  Container(api, "Notification API", "Go, gRPC", "Валидация, ключ идемпотентности, запись в Kafka")
+  ContainerQueue(kafka, "Kafka", "Apache Kafka 3.x, RF=3, acks=all", "tx.requested, receipts, delivery-events")
+  Container(starter, "Workflow Starter", "Go", "Стартует workflow с id = notification_id")
+  Container(temporal, "Temporal Cluster", "Temporal Server, 3 AZ", "Durable-таймеры, история workflow, task queues")
+  ContainerDb(tdb, "Temporal Persistence", "Cassandra 4, 6–9 узлов, RF=3", "История и таймеры workflow, retention 3 дня")
+  ContainerDb(es, "Temporal Visibility", "Elasticsearch", "Поиск workflow по user_id, статусу, каналу")
+  Container(orch, "Delivery Orchestrator", "Go, Temporal worker", "Workflow CriticalDelivery: план, ожидание квитанций, failover")
+  Container(pushgw, "Push Gateway", "Go, activity worker, task queue push", "Отправка push, ttl = таймаут шага, apns-collapse-id / tag")
+  Container(smsgw, "SMS Gateway", "Go, activity worker, task queue sms", "Отправка SMS, circuit breaker, переключение агрегатора")
+  Container(emailgw, "Email Gateway", "Go, activity worker, task queue email", "Отправка email через двух провайдеров")
+  Container(receipt_api, "Receipt API", "Go, HTTPS", "Квитанции приложения и вебхуки провайдеров")
+  Container(receipt_router, "Receipt Router", "Go", "SignalWorkflow по notification_id")
+  Container(pref, "Preference Service", "Go + PostgreSQL + Redis", "Настройки, согласия, контакты, push-токены")
+  Container(inbox, "Inbox Service", "Go + Cassandra", "In-app лента уведомлений")
+  ContainerDb(ch, "Delivery Analytics", "ClickHouse", "События доставки, отчёты, хранение 3 года")
+  Container(obs, "Observability", "Prometheus, Grafana, OpenTelemetry, Alertmanager", "Метрики, трейсы, алерты")
+}
+
+Rel(producers, api, "SendNotification", "gRPC")
+Rel(api, kafka, "tx.requested", "Kafka")
+Rel(kafka, starter, "tx.requested", "Kafka")
+Rel(starter, temporal, "StartWorkflow, RejectDuplicate", "gRPC")
+Rel(temporal, tdb, "История, таймеры", "CQL")
+Rel(temporal, es, "Visibility", "HTTPS")
+Rel(orch, temporal, "Workflow tasks", "gRPC long poll")
+Rel(pushgw, temporal, "Activity tasks", "gRPC long poll")
+Rel(smsgw, temporal, "Activity tasks", "gRPC long poll")
+Rel(emailgw, temporal, "Activity tasks", "gRPC long poll")
+Rel(orch, pref, "План каналов (local activity)", "gRPC")
+Rel(orch, inbox, "Запись в ленту (local activity)", "gRPC")
+Rel(pushgw, push_prov, "Push", "HTTPS")
+Rel(smsgw, sms_prov, "SMS, client_msg_id", "HTTPS")
+Rel(emailgw, email_prov, "Email", "HTTPS")
+Rel(push_prov, app, "Push")
+Rel(app, receipt_api, "Квитанция о получении", "HTTPS")
+Rel(sms_prov, receipt_api, "DLR", "HTTPS webhook")
+Rel(email_prov, receipt_api, "Статус", "HTTPS webhook")
+Rel(receipt_api, kafka, "receipts", "Kafka")
+Rel(kafka, receipt_router, "receipts", "Kafka")
+Rel(receipt_router, temporal, "SignalWorkflow", "gRPC")
+Rel(orch, kafka, "delivery-events", "Kafka")
+Rel(kafka, ch, "delivery-events", "Kafka engine")
+Rel(obs, temporal, "Метрики и трейсы", "OTLP / Prometheus")
+
+SHOW_LEGEND()
+@enduml

@@ -1,0 +1,49 @@
+@startuml seq-b-failover
+title Вариант 2: failover push -> SMS, отказ SMS-агрегатора A
+autonumber
+participant "Temporal\nCluster" as T
+participant "Delivery\nOrchestrator" as O
+participant "Push\nGateway" as PG
+participant "FCM / APNs" as FCM
+participant "SMS\nGateway" as SG
+participant "SMS-агрегатор A" as A
+participant "SMS-агрегатор B" as B
+participant "Receipt API" as RA
+queue "Kafka" as K
+participant "Receipt\nRouter" as RR
+
+O -> T: ScheduleActivity(SendPush)
+T -> PG: activity task
+PG -> FCM: send(token, apns-collapse-id / tag, ttl=10s)
+FCM --> PG: message_id
+PG --> T: completed
+O -> T: StartTimer(10s) + ожидание signal Delivered
+note over FCM: устройство офлайн,\nчерез 10 с FCM отбрасывает push по ttl
+...10 секунд без квитанции...
+T -> O: workflow task (TimerFired)
+O -> T: ScheduleActivity(SendSms, queue=sms,\nretry: 3 попытки, backoff 200 мс..2 с)
+T -> SG: activity task
+SG -> A: send(phone, text, client_msg_id=nid:sms)
+A --> SG: 503
+note over SG: circuit breaker агрегатора A открыт\n(5 ошибок за 10 с), дальше трафик идёт в B
+SG -> B: send(phone, text, client_msg_id=nid:sms)
+B --> SG: accepted(msg_id)
+SG -> K: delivery-events(SMS_SENT, provider=B)
+SG --> T: completed
+T -> O: workflow task
+O -> T: StartTimer(120s) + ожидание signal Delivered
+B -> RA: DLR delivered(msg_id)
+RA -> K: receipts
+K -> RR: receipts
+RR -> T: SignalWorkflow(notification_id, Delivered{sms})
+T -> O: workflow task (signal)
+O -> T: CancelTimer; EmitEvent(DELIVERED, channel=sms); CompleteWorkflow
+alt DLR failed или таймер 120 с сработал
+  O -> T: ScheduleActivity(SendEmail, queue=email)
+  note right of O: после email: UNCONFIRMED или FAILED,\nалерт; workflow ждёт поздние квитанции до 1 ч
+end
+alt квитанция push пришла после перехода на SMS
+  RR -> T: SignalWorkflow(Delivered{push})
+  note right of O: фиксируется метрика cross_channel_duplicate
+end
+@enduml

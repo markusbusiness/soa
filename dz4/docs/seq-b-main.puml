@@ -1,0 +1,45 @@
+@startuml seq-b-main
+title Вариант 2: основной сценарий (push подтверждён)
+autonumber
+participant "Продуктовый\nсервис" as P
+participant "Notification\nAPI" as API
+queue "Kafka" as K
+participant "Workflow\nStarter" as WS
+participant "Temporal\nCluster" as T
+participant "Delivery\nOrchestrator" as O
+participant "Preference\nService" as PS
+participant "Inbox\nService" as IN
+participant "Push\nGateway" as PG
+participant "FCM / APNs" as FCM
+participant "Мобильное\nприложение" as APP
+participant "Receipt API" as RA
+participant "Receipt\nRouter" as RR
+
+P -> API: SendNotification(idempotency_key, user_id, type=TX, template, data)
+API -> K: produce tx.requested (key=notification_id, acks=all)
+API --> P: 202 Accepted(notification_id = uuid5(producer, idempotency_key))
+K -> WS: tx.requested
+WS -> T: StartWorkflow(CriticalDelivery, id=notification_id,\nreuse policy=RejectDuplicate)
+T --> WS: started
+WS -> K: commit offset
+T -> O: workflow task
+O -> PS: local activity GetDeliveryPlan(user_id, TX)
+PS --> O: [push 10s, sms 120s, email], контакты, токены
+O -> IN: local activity WriteInbox(notification)
+O -> T: ScheduleActivity(SendPush, queue=push)
+T -> PG: activity task
+PG -> FCM: send(token, apns-collapse-id / tag = notification_id, ttl=10s)
+FCM --> PG: message_id
+PG -> K: delivery-events(PUSH_SENT)
+PG --> T: completed
+T -> O: workflow task
+O -> T: StartTimer(10s) + ожидание signal Delivered
+FCM -> APP: push
+APP -> RA: POST /receipts {notification_id, channel=push}
+RA -> K: receipts
+RA --> APP: 204
+K -> RR: receipts
+RR -> T: SignalWorkflow(notification_id, Delivered{push})
+T -> O: workflow task (signal)
+O -> T: CancelTimer; local activity EmitEvent(DELIVERED); CompleteWorkflow
+@enduml

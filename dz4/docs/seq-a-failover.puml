@@ -1,0 +1,44 @@
+@startuml seq-a-failover
+title Вариант 1: failover push -> SMS, отказ SMS-агрегатора A
+autonumber
+participant "Push\nSender" as PSND
+participant "FCM / APNs" as FCM
+database "Delivery\nState DB" as DB
+participant "Escalation\nScheduler" as ES
+participant "Outbox\nRelay" as OR
+queue "Kafka" as K
+participant "SMS\nSender" as SS
+participant "SMS-агрегатор A" as A
+participant "SMS-агрегатор B" as B
+participant "Receipt API" as RA
+participant "Receipt\nHandler" as RH
+
+PSND -> DB: state='PUSH_SENDING' WHERE state='PUSH_PENDING'
+PSND -> FCM: send(token, apns-collapse-id / tag, ttl=10s)
+FCM --> PSND: message_id
+PSND -> DB: state='PUSH_SENT', next_action_at=now()+10s
+note over FCM: устройство офлайн,\nчерез 10 с FCM отбрасывает push по ttl
+...10 секунд без квитанции...
+ES -> DB: SELECT ... WHERE next_action_at <= now()\nFOR UPDATE SKIP LOCKED LIMIT 500
+ES -> DB: UPDATE SET state='SMS_PENDING', next_action_at=now()+30s\nWHERE id=? AND state='PUSH_SENT';\nINSERT outbox(tx.send.sms); COMMIT
+OR -> K: tx.send.sms
+K -> SS: tx.send.sms
+SS -> DB: UPDATE SET state='SMS_SENDING'\nWHERE id=? AND state='SMS_PENDING'
+note right of SS: 0 строк (уже DELIVERED) -> SMS не отправляется
+SS -> A: send(phone, text, client_msg_id=nid:sms)
+A --> SS: 503
+SS -> A: повтор через 200 мс
+A --> SS: 503
+note over SS: circuit breaker агрегатора A открыт\n(5 ошибок за 10 с)
+SS -> B: send(phone, text, client_msg_id=nid:sms)
+B --> SS: accepted(msg_id)
+SS -> DB: UPDATE SET state='SMS_SENT', provider='B', next_action_at=now()+120s\nWHERE id=? AND state='SMS_SENDING'
+B -> RA: DLR delivered(msg_id)
+RA -> K: receipts
+K -> RH: receipts
+RH -> DB: UPDATE SET state='DELIVERED', channel='sms', next_action_at=NULL\nWHERE id=? AND state NOT IN ('DELIVERED','UNCONFIRMED','FAILED')
+alt DLR не пришёл за 120 с или DLR failed
+  ES -> DB: state='EMAIL_PENDING' + outbox(tx.send.email)
+  note right of ES: после email шаг финальный:\nstate='UNCONFIRMED' или 'FAILED', алерт дежурному
+end
+@enduml
