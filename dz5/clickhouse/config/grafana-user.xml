@@ -1,0 +1,17 @@
+<clickhouse>
+    <profiles>
+        <grafana_readonly>
+            <readonly>2</readonly>
+            <max_execution_time>30</max_execution_time>
+        </grafana_readonly>
+    </profiles>
+    <users>
+        <grafana>
+            <password from_env="CLICKHOUSE_GRAFANA_PASSWORD"/>
+            <profile>grafana_readonly</profile>
+            <networks><ip>::/0</ip></networks>
+            <allow_databases><database>analytics</database></allow_databases>
+            <quota>default</quota>
+        </grafana>
+    </users>
+</clickhouse>

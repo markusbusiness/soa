@@ -1,0 +1,7 @@
+pytest==9.2.0
+httpx==0.28.1
+clickhouse-connect==1.13.0
+psycopg[binary]==3.3.9
+boto3==1.44.11
+confluent-kafka[avro,schemaregistry]==2.16.2
+fastavro==1.13.1

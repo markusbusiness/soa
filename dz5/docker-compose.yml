@@ -1,0 +1,341 @@
+x-kafka-env: &kafka-env
+  CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+
+x-kafka: &kafka
+  image: confluentinc/cp-kafka:8.2.5
+  healthcheck:
+    test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+    interval: 15s
+    timeout: 20s
+    retries: 20
+    start_period: 20s
+  restart: unless-stopped
+
+x-kafka-bootstrap: &kafka-bootstrap kafka-1:9092,kafka-2:9092,kafka-3:9092
+
+x-clickhouse-auth: &clickhouse-auth
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_USER: analytics
+  CLICKHOUSE_PASSWORD: analytics
+
+x-python-healthcheck: &python-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+  interval: 5s
+  timeout: 5s
+  retries: 20
+  start_period: 10s
+
+services:
+  kafka-1:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+
+  kafka-2:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+
+  kafka-3:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:8.2.5
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-1:9092,PLAINTEXT://kafka-2:9092,PLAINTEXT://kafka-3:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
+      SCHEMA_REGISTRY_HEAP_OPTS: -Xms128m -Xmx256m
+    ports:
+      - "${SCHEMA_REGISTRY_PORT:-8081}:8081"
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8081/subjects"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  kafka-init:
+    image: confluentinc/cp-kafka:8.2.5
+    entrypoint: ["sh", "-c", "/scripts/create-topics.sh && python3 /scripts/register_schema.py"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      TOPIC_NAME: movie-events
+      TOPIC_PARTITIONS: 6
+      TOPIC_REPLICATION_FACTOR: 3
+      TOPIC_MIN_INSYNC_REPLICAS: 2
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SCHEMA_SUBJECT: movie-events-value
+      SCHEMA_COMPATIBILITY: BACKWARD
+      SCHEMA_FILES: /schemas/movie_event.v1.avsc,/schemas/movie_event.v2.avsc
+    volumes:
+      - ./kafka:/scripts:ro
+      - ./schemas:/schemas:ro
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_GRAFANA_PASSWORD: grafana
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/config/grafana-user.xml:/etc/clickhouse-server/users.d/grafana-user.xml:ro
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  clickhouse-migrations:
+    image: clickhouse/clickhouse-server:26.8
+    entrypoint: ["sh", "/migrate.sh"]
+    environment:
+      <<: *clickhouse-auth
+    volumes:
+      - ./clickhouse/migrate.sh:/migrate.sh:ro
+      - ./clickhouse/migrations:/migrations:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  dlq-recovery:
+    build: ./dlq-recovery
+    environment:
+      <<: *clickhouse-auth
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      DLQ_RECOVERY_INTERVAL_SECONDS: ${DLQ_RECOVERY_INTERVAL_SECONDS:-30}
+    depends_on:
+      clickhouse-migrations:
+        condition: service_completed_successfully
+    healthcheck: *python-healthcheck
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: metrics
+      POSTGRES_USER: metrics
+      POSTGRES_PASSWORD: metrics
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metrics -d metrics"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  postgres-migrations:
+    image: flyway/flyway:11-alpine
+    command: -url=jdbc:postgresql://postgres:5432/metrics -user=metrics -password=metrics -connectRetries=30 migrate
+    volumes:
+      - ./postgres/migrations:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio-secret
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio-init:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    entrypoint: ["sh", "-c", "mc alias set local http://minio:9000 minio minio-secret && mc mb --ignore-existing local/movie-analytics"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  producer:
+    build: ./producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_TOPIC: movie-events
+      KAFKA_DELIVERY_TIMEOUT_MS: ${KAFKA_DELIVERY_TIMEOUT_MS:-10000}
+      PUBLISH_MAX_ATTEMPTS: ${PUBLISH_MAX_ATTEMPTS:-4}
+      PUBLISH_BACKOFF_BASE_MS: ${PUBLISH_BACKOFF_BASE_MS:-200}
+      PUBLISH_BACKOFF_MAX_MS: ${PUBLISH_BACKOFF_MAX_MS:-5000}
+      GENERATOR_ENABLED: ${GENERATOR_ENABLED:-true}
+      GENERATOR_NEW_USERS_PER_DAY: ${GENERATOR_NEW_USERS_PER_DAY:-80}
+      GENERATOR_BACKFILL_DAYS: ${GENERATOR_BACKFILL_DAYS:-14}
+    volumes:
+      - producer-state:/state
+    ports:
+      - "${PRODUCER_PORT:-8010}:8000"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck: *python-healthcheck
+    restart: unless-stopped
+
+  aggregator:
+    build: ./aggregator
+    environment:
+      <<: *clickhouse-auth
+      DATABASE_URL: postgresql://metrics:metrics@postgres:5432/metrics
+      AGGREGATION_INTERVAL_SECONDS: ${AGGREGATION_INTERVAL_SECONDS:-60}
+      TOP_MOVIES_LIMIT: ${TOP_MOVIES_LIMIT:-10}
+    ports:
+      - "${AGGREGATOR_PORT:-8011}:8000"
+    depends_on:
+      clickhouse-migrations:
+        condition: service_completed_successfully
+      postgres-migrations:
+        condition: service_completed_successfully
+    healthcheck: *python-healthcheck
+    restart: unless-stopped
+
+  exporter:
+    build: ./exporter
+    environment:
+      DATABASE_URL: postgresql://metrics:metrics@postgres:5432/metrics
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio-secret
+      S3_BUCKET: movie-analytics
+      S3_PREFIX: daily
+      EXPORT_INTERVAL_SECONDS: ${EXPORT_INTERVAL_SECONDS:-300}
+    ports:
+      - "${EXPORTER_PORT:-8012}:8000"
+    depends_on:
+      postgres-migrations:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck: *python-healthcheck
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.0.14
+    environment:
+      GF_PLUGINS_PREINSTALL_SYNC: grafana-clickhouse-datasource@4.23.4
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/movie-analytics.json
+      CLICKHOUSE_GRAFANA_PASSWORD: grafana
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3030}:3000"
+    depends_on:
+      clickhouse-migrations:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  tests:
+    profiles: [test]
+    build: ./tests
+    environment:
+      <<: *clickhouse-auth
+      PRODUCER_URL: http://producer:8000
+      AGGREGATOR_URL: http://aggregator:8000
+      EXPORTER_URL: http://exporter:8000
+      DLQ_RECOVERY_URL: http://dlq-recovery:8000
+      GRAFANA_URL: http://grafana:3000
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      DATABASE_URL: postgresql://metrics:metrics@postgres:5432/metrics
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio-secret
+      PYTHONPATH: /producer-src
+    volumes:
+      - ./producer/src:/producer-src:ro
+    depends_on:
+      producer:
+        condition: service_healthy
+      aggregator:
+        condition: service_healthy
+      exporter:
+        condition: service_healthy
+      dlq-recovery:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+  clickhouse-data:
+  postgres-data:
+  minio-data:
+  grafana-data:
+  producer-state:
